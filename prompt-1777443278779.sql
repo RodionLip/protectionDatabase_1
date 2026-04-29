@@ -1082,356 +1082,112 @@ CREATE POLICY course_staff_admin_all ON app.course_staff FOR ALL TO app_admin US
 
 
 -- =====================================================
--- ПРАКТИКА 9: Анализ уязвимого к SQL-инъекциям кода
--- приложения и его исправление
+-- ПРАКТИКА 9: Защита от SQL-инъекций
 -- =====================================================
--- Предметная область: наши таблицы app.users, app.courses и т.д.
--- + лабораторный стенд injection_lab для безопасных экспериментов
+-- Работаем с существующими таблицами app.users, app.courses,
+-- app.enrollments, app.submissions, app.forum_posts и т.д.
+-- Новых таблиц и данных НЕ создаём.
 -- =====================================================
-
-
--- =====================================================
--- ЧАСТЬ 1: ПОДГОТОВКА ЛАБОРАТОРНОГО СТЕНДА
--- =====================================================
-
--- Задание 1.1: Создание схемы и тестовых данных
--- Создаём отдельную схему, чтобы безопасно моделировать инъекции
-
-CREATE SCHEMA IF NOT EXISTS injection_lab;
-
-DROP TABLE IF EXISTS injection_lab.tasks CASCADE;
-DROP TABLE IF EXISTS injection_lab.users CASCADE;
-
-CREATE TABLE injection_lab.users (
-    user_id SERIAL PRIMARY KEY,
-    username TEXT NOT NULL UNIQUE,
-    full_name TEXT NOT NULL,
-    role_name TEXT NOT NULL,
-    email TEXT NOT NULL UNIQUE,
-    password_plain TEXT NOT NULL
-);
-
-CREATE TABLE injection_lab.tasks (
-    task_id SERIAL PRIMARY KEY,
-    title TEXT NOT NULL,
-    description TEXT,
-    status TEXT NOT NULL DEFAULT 'new',
-    priority TEXT NOT NULL DEFAULT 'medium',
-    assignee_username TEXT NOT NULL REFERENCES injection_lab.users(username),
-    created_at TIMESTAMP NOT NULL DEFAULT NOW()
-);
-
-INSERT INTO injection_lab.users (username, full_name, role_name, email, password_plain) VALUES
-('alice', 'Alice Ivanova',   'employee', 'alice@corp.local', 'alice123'),
-('bob',   'Bob Petrov',      'manager',  'bob@corp.local',   'bob123'),
-('carol', 'Carol Sidorova',  'admin',    'carol@corp.local',  'carol123');
-
-INSERT INTO injection_lab.tasks (title, description, status, priority, assignee_username) VALUES
-('Подготовить отчёт',       'Собрать метрики по проекту',       'in_progress', 'high',     'alice'),
-('Проверить права доступа', 'Аудит ролей PostgreSQL',           'new',         'critical', 'bob'),
-('Обновить регламент',      'Документация по реагированию',     'done',        'medium',   'carol'),
-('Закрыть инцидент',        'Проверить журналы событий',        'new',         'high',     'alice');
-
--- Проверка: users = 3, tasks = 4
-SELECT 'users' AS table_name, COUNT(*) AS row_count FROM injection_lab.users
-UNION ALL
-SELECT 'tasks', COUNT(*) FROM injection_lab.tasks;
 
 
 -- =====================================================
--- ЧАСТЬ 2: АНАЛИЗ УЯЗВИМЫХ ФРАГМЕНТОВ КОДА
+-- ЧАСТЬ 1: АНАЛИЗ УЯЗВИМЫХ ФРАГМЕНТОВ КОДА
 -- =====================================================
+-- Показываем, как НЕ надо писать код приложения,
+-- на примере наших таблиц app.users, app.courses и т.д.
 
 -- =====================================================
--- Задание 2.1: Уязвимая аутентификация
+-- 1.1: Уязвимая аутентификация (app.users)
 -- =====================================================
 
 -- УЯЗВИМЫЙ КОД (JavaScript / Node.js + pg):
 --
--- async function login(client, username, password) {
+-- async function login(client, username, passwordHash) {
 --   const sql =
---     "SELECT user_id, username, role_name " +
---     "FROM injection_lab.users " +
+--     "SELECT user_id, username, full_name, is_active " +
+--     "FROM app.users " +
 --     "WHERE username = '" + username + "' " +
---     "AND password_plain = '" + password + "'";
+--     "AND password_hash = '" + passwordHash + "'";
 --   return client.query(sql);
 -- }
 
 -- ПОЧЕМУ УЯЗВИМ:
--- username и password подставляются в SQL через конкатенацию строк
--- без экранировки. Злоумышленник может внедрить произвольный SQL-код.
+-- username и passwordHash подставляются через конкатенацию строк
+-- без экранировки. Злоумышленник может внедрить произвольный SQL.
 
 -- Пример вредоносного ввода:
 -- username: ' OR 1=1 --
--- password: anything
+-- passwordHash: anything
 
--- Итоговый запрос после подстановки:
--- SELECT user_id, username, role_name
--- FROM injection_lab.users
--- WHERE username = '' OR 1=1 --' AND password_plain = 'anything'
+-- Итоговый запрос:
+-- SELECT user_id, username, full_name, is_active
+-- FROM app.users
+-- WHERE username = '' OR 1=1 --' AND password_hash = 'anything'
 
 -- Разбор:
 -- 1) username = '' — ложно
 -- 2) OR 1=1 — всегда истинно → всё WHERE истинно
 -- 3) -- комментирует проверку пароля
--- 4) Результат: возвращаются ВСЕ пользователи — обход аутентификации
-
--- Демонстрация — нормальный запрос:
-SELECT user_id, username, role_name
-FROM injection_lab.users
-WHERE username = 'alice' AND password_plain = 'alice123';
--- Результат: 1 строка (alice)
-
--- Демонстрация — атакованный запрос:
-SELECT user_id, username, role_name
-FROM injection_lab.users
-WHERE username = '' OR 1=1 --' AND password_plain = 'anything';
--- Результат: ВСЕ 3 строки — обход аутентификации!
-
--- Злоумышленник может получить:
--- • user_id, username, role_name ВСЕХ пользователей
--- • Авторизоваться как первый пользователь (возможно admin)
--- • Через UNION извлечь email и пароли
+-- 4) Результат: возвращаются ВСЕ 8 пользователей — обход аутентификации!
 
 
 -- =====================================================
--- Задание 2.2: Уязвимый поиск задач
+-- 1.2: Уязвимый поиск курсов (app.courses)
 -- =====================================================
 
 -- УЯЗВИМЫЙ КОД:
 --
--- async function findTasksByStatus(client, status) {
+-- async function searchCourses(client, keyword) {
 --   const sql =
---     "SELECT task_id, title, status, priority " +
---     "FROM injection_lab.tasks " +
---     "WHERE status = '" + status + "'";
+--     "SELECT course_id, title, description, price, status " +
+--     "FROM app.courses " +
+--     "WHERE title ILIKE '%" + keyword + "%' " +
+--     "AND status = 'published'";
 --   return client.query(sql);
 -- }
 
--- Пример инъекции (все задачи):
--- status: ' OR 1=1 --
-
+-- Пример инъекции — получить ВСЕ курсы (включая draft, archived):
+-- keyword: %' OR 1=1 --
 -- Итоговый запрос:
--- SELECT task_id, title, status, priority
--- FROM injection_lab.tasks
--- WHERE status = '' OR 1=1 --'
-
--- Как работает --:
--- Двойной дефис — однострочный комментарий в SQL.
--- Всё после -- игнорируется, включая закрывающую кавычку.
-
--- Демонстрация — нормальный запрос:
-SELECT task_id, title, status, priority
-FROM injection_lab.tasks
-WHERE status = 'new';
--- Результат: 2 строки (задачи со статусом new)
-
--- Демонстрация — атакованный запрос:
-SELECT task_id, title, status, priority
-FROM injection_lab.tasks
-WHERE status = '' OR 1=1 --';
--- Результат: ВСЕ 4 строки — утечка всех задач!
-
--- Сравнение:
--- Нормальный: 2 задачи (new)
--- Атакованный: 4 задачи (все, включая in_progress и done)
+-- ... WHERE title ILIKE '%%' OR 1=1 --% AND status = 'published'
+-- Результат: все 4 курса вместо 2 опубликованных
 
 
 -- =====================================================
--- Задание 2.3: Уязвимая сортировка
+-- 1.3: Уязвимая сортировка курсов (ORDER BY)
 -- =====================================================
 
 -- УЯЗВИМЫЙ КОД:
 --
--- async function listTasks(client, sortField, sortDirection) {
+-- async function listCourses(client, sortBy, order) {
 --   const sql =
---     "SELECT task_id, title, priority, created_at " +
---     "FROM injection_lab.tasks " +
---     "ORDER BY " + sortField + " " + sortDirection;
+--     "SELECT course_id, title, price, status, created_at " +
+--     "FROM app.courses " +
+--     "WHERE status = 'published' " +
+--     "ORDER BY " + sortBy + " " + order;
 --   return client.query(sql);
 -- }
 
--- 1) Почему параметризация неприменима к имени столбца:
---    Параметры ($1, $2) подставляются как ЗНАЧЕНИЯ (литералы).
---    Имя столбца — идентификатор SQL. ORDER BY $1 не будет
---    работать как сортировка по столбцу.
+-- Почему параметризация неприменима к имени столбца:
+-- Параметры ($1, $2) подставляются как ЗНАЧЕНИЯ (литералы).
+-- Имя столбца — идентификатор SQL. ORDER BY $1 не работает.
 
--- 2) Риски без проверки sortField/sortDirection:
---    a) Утечка данных: sortField = "(SELECT password_plain FROM injection_lab.users LIMIT 1)"
---    b) Удаление таблицы: sortField = "title; DROP TABLE injection_lab.tasks; --"
---    c) Повышение прав: sortField = "title; UPDATE injection_lab.users SET role_name='admin' WHERE username='alice'; --"
---    d) Разведка БД: sortField = "(SELECT column_name FROM information_schema.columns LIMIT 1)"
+-- Риски:
+-- a) Утечка данных: sortBy = "(SELECT password_hash FROM app.users LIMIT 1)"
+-- b) Удаление таблицы: sortBy = "title; DROP TABLE app.courses; --"
+-- c) Повышение прав: sortBy = "title; UPDATE app.users SET ... --"
 
--- 3) Безопасная стратегия: БЕЛЫЙ СПИСОК (whitelist)
---    Словарь допустимых значений + значение по умолчанию.
+-- Безопасная стратегия: БЕЛЫЙ СПИСОК (whitelist)
 
 
 -- =====================================================
--- ЧАСТЬ 3: ИСПРАВЛЕНИЕ УЯЗВИМОСТЕЙ
+-- ЧАСТЬ 2: ИСПРАВЛЕНИЕ — БЕЗОПАСНЫЕ ХРАНИМЫЕ ФУНКЦИИ
 -- =====================================================
-
--- =====================================================
--- Задание 3.1: Безопасная аутентификация (параметризация)
--- =====================================================
-
--- ИСПРАВЛЕННЫЙ КОД:
---
--- async function loginSafe(client, username, password) {
---   const sql = {
---     text:
---       "SELECT user_id, username, role_name " +
---       "FROM injection_lab.users " +
---       "WHERE username = $1 AND password_plain = $2",
---     values: [username, password]
---   };
---   return client.query(sql);
--- }
-
--- Почему ' OR 1=1 -- больше не работает:
--- $1 воспринимается PostgreSQL как ЛИТЕРАЛ. Строка "' OR 1=1 --"
--- не интерпретируется как SQL, а ищется буквально в поле username.
-
--- Проверка через PREPARE/EXECUTE:
-PREPARE login_safe(TEXT, TEXT) AS
-    SELECT user_id, username, role_name
-    FROM injection_lab.users
-    WHERE username = $1 AND password_plain = $2;
-
--- Корректный ввод:
-EXECUTE login_safe('alice', 'alice123');
--- Результат: 1 строка (alice)
-
--- Неверный пароль:
-EXECUTE login_safe('alice', 'wrong');
--- Результат: 0 строк
-
--- Вредоносный ввод — БЕЗОПАСНО:
-EXECUTE login_safe(''' OR 1=1 --', 'anything');
--- Результат: 0 строк (инъекция НЕ сработала!)
-
-DEALLOCATE login_safe;
-
+-- Создаём функции с параметризацией и белыми списками
+-- для всех основных операций с нашими таблицами.
 
 -- =====================================================
--- Задание 3.2: Безопасный поиск задач (параметризация)
--- =====================================================
-
--- ИСПРАВЛЕННЫЙ КОД:
---
--- async function findTasksByStatusSafe(client, status) {
---   return client.query(
---     "SELECT task_id, title, status, priority " +
---     "FROM injection_lab.tasks " +
---     "WHERE status = $1",
---     [status]
---   );
--- }
-
--- Проверка:
-PREPARE find_tasks_safe(TEXT) AS
-    SELECT task_id, title, status, priority
-    FROM injection_lab.tasks
-    WHERE status = $1;
-
-EXECUTE find_tasks_safe('new');
--- Результат: 2 строки (только new)
-
-EXECUTE find_tasks_safe(''' OR 1=1 --');
--- Результат: 0 строк (инъекция НЕ сработала!)
-
-DEALLOCATE find_tasks_safe;
-
-
--- =====================================================
--- Задание 3.3: Безопасная сортировка (белые списки)
--- =====================================================
-
--- ИСПРАВЛЕННЫЙ КОД:
---
--- async function listTasksSafe(client, sortField, sortDirection) {
---   const allowedFields = {
---     created_at: "created_at",
---     priority:   "priority",
---     title:      "title",
---     status:     "status"
---   };
---   const allowedDirections = {
---     asc:  "ASC",
---     desc: "DESC"
---   };
---   const field = allowedFields[sortField] ?? "created_at";
---   const direction = allowedDirections[sortDirection] ?? "DESC";
---
---   const sql =
---     "SELECT task_id, title, priority, created_at, status " +
---     "FROM injection_lab.tasks " +
---     "ORDER BY " + field + " " + direction;
---   return client.query(sql);
--- }
-
--- Допустимые значения — работает:
-SELECT task_id, title, priority, created_at, status
-FROM injection_lab.tasks
-ORDER BY title ASC;
-
-SELECT task_id, title, priority, created_at, status
-FROM injection_lab.tasks
-ORDER BY priority DESC;
-
--- Недопустимое значение (title; DROP TABLE ...) → подставится created_at DESC:
-SELECT task_id, title, priority, created_at, status
-FROM injection_lab.tasks
-ORDER BY created_at DESC;
--- Вредоносная строка полностью проигнорирована!
-
-
--- =====================================================
--- ЧАСТЬ 4: ПРОВЕРКА ЗАЩИТЫ НА УРОВНЕ БД
--- =====================================================
-
--- Задание 4.1: Ограниченная роль приложения
-DROP ROLE IF EXISTS web_app_demo;
-CREATE ROLE web_app_demo LOGIN PASSWORD 'demo123';
-
-REVOKE ALL ON SCHEMA injection_lab FROM PUBLIC;
-GRANT USAGE ON SCHEMA injection_lab TO web_app_demo;
-REVOKE ALL ON ALL TABLES IN SCHEMA injection_lab FROM web_app_demo;
-GRANT SELECT ON injection_lab.users TO web_app_demo;
-GRANT SELECT ON injection_lab.tasks TO web_app_demo;
-GRANT UPDATE(status) ON injection_lab.tasks TO web_app_demo;
-
--- Как это ограничивает ущерб:
--- • DROP TABLE — невозможен (нет прав DDL)
--- • DELETE — невозможен (нет права DELETE)
--- • INSERT — невозможен (нет права INSERT)
--- • UPDATE — только поле status в tasks
--- Даже при инъекции злоумышленник не сможет модифицировать или уничтожить данные
-
--- Задание 4.2: Проверка матрицы прав
-SELECT grantee, table_schema, table_name, privilege_type
-FROM information_schema.role_table_grants
-WHERE grantee = 'web_app_demo'
-ORDER BY table_name, privilege_type;
-
--- Ожидаемый результат:
--- web_app_demo | injection_lab | tasks | SELECT
--- web_app_demo | injection_lab | tasks | UPDATE
--- web_app_demo | injection_lab | users | SELECT
-
--- Сравнение потенциального ущерба:
--- web_app_demo:     SELECT + UPDATE(status) — минимальный ущерб
--- Владелец схемы:   ВСЕ операции на ВСЕ таблицы — полный контроль
--- Суперпользователь: ВСЕ + pg_shadow, COPY, CREATE EXTENSION — тотальный контроль
-
-
--- =====================================================
--- ЧАСТЬ 4 (ДОПОЛНЕНИЕ): ЗАЩИТА СУЩЕСТВУЮЩИХ ТАБЛИЦ app
--- =====================================================
--- Применяем защиту от SQL-инъекций к нашим реальным таблицам:
--- app.users, app.courses, app.enrollments, app.forum_posts и т.д.
-
--- =====================================================
--- Безопасная аутентификация для app.users
+-- 2.1: Безопасная аутентификация (ПАРАМЕТРИЗАЦИЯ)
 -- =====================================================
 
 CREATE OR REPLACE FUNCTION app.safe_login(
@@ -1452,27 +1208,16 @@ AS $$
       AND u.password_hash = p_password_hash;
 $$;
 
--- Вызов в приложении (Node.js):
+-- В приложении вызывается так:
 -- const result = await client.query(
 --   'SELECT * FROM app.safe_login($1, $2)',
 --   [username, passwordHash]
 -- );
-
--- Проверка:
-PREPARE test_app_login(TEXT, TEXT) AS
-    SELECT * FROM app.safe_login($1, $2);
-
-EXECUTE test_app_login('student1', 'hash1');
--- Результат: 1 строка (student1)
-
-EXECUTE test_app_login(''' OR 1=1 --', 'anything');
--- Результат: 0 строк — инъекция НЕ работает!
-
-DEALLOCATE test_app_login;
+-- Теперь ' OR 1=1 -- будет искаться как буквальный текст в username.
 
 
 -- =====================================================
--- Безопасный поиск курсов для app.courses
+-- 2.2: Безопасный поиск курсов (ПАРАМЕТРИЗАЦИЯ)
 -- =====================================================
 
 CREATE OR REPLACE FUNCTION app.safe_search_courses(
@@ -1493,22 +1238,9 @@ AS $$
       AND c.status = 'published';
 $$;
 
--- Вызов: SELECT * FROM app.safe_search_courses($1)
--- Проверка:
-PREPARE test_search_courses(TEXT) AS
-    SELECT * FROM app.safe_search_courses($1);
-
-EXECUTE test_search_courses('Python');
--- Результат: 1 строка (Основы Python, published)
-
-EXECUTE test_search_courses(''' OR 1=1 --');
--- Результат: 0 строк — инъекция НЕ работает!
-
-DEALLOCATE test_search_courses;
-
 
 -- =====================================================
--- Безопасная выборка зачислений для app.enrollments
+-- 2.3: Безопасная выборка зачислений (ПАРАМЕТРИЗАЦИЯ)
 -- =====================================================
 
 CREATE OR REPLACE FUNCTION app.safe_get_enrollments(
@@ -1528,12 +1260,11 @@ AS $$
     WHERE e.user_id = p_user_id;
 $$;
 
--- Вызов: SELECT * FROM app.safe_get_enrollments($1)
--- Тип INTEGER не позволяет передать строку '1 OR 1=1' — ошибка типизации
+-- Тип INTEGER не позволяет передать строку '1 OR 1=1' — ошибка типизации.
 
 
 -- =====================================================
--- Безопасная сортировка курсов (белый список)
+-- 2.4: Безопасная сортировка курсов (БЕЛЫЙ СПИСОК)
 -- =====================================================
 
 CREATE OR REPLACE FUNCTION app.safe_list_courses(
@@ -1580,16 +1311,9 @@ BEGIN
 END;
 $$;
 
--- Проверка:
-SELECT * FROM app.safe_list_courses('title', 'asc');
-SELECT * FROM app.safe_list_courses('price', 'desc');
--- Вредоносный ввод → подставится значение по умолчанию:
-SELECT * FROM app.safe_list_courses('title; DROP TABLE app.users; --', 'asc');
--- Результат: сортировка по created_at DESC — атака проигнорирована!
-
 
 -- =====================================================
--- Безопасная работа с форумом для app.forum_posts
+-- 2.5: Безопасная работа с форумом (ПАРАМЕТРИЗАЦИЯ)
 -- =====================================================
 
 CREATE OR REPLACE FUNCTION app.safe_get_forum_posts(
@@ -1613,7 +1337,7 @@ $$;
 
 
 -- =====================================================
--- Безопасная отправка работы для app.submissions
+-- 2.6: Безопасная отправка работы (ПАРАМЕТРИЗАЦИЯ)
 -- =====================================================
 
 CREATE OR REPLACE FUNCTION app.safe_submit_assignment(
@@ -1633,7 +1357,7 @@ $$;
 
 
 -- =====================================================
--- Безопасное обновление статуса зачисления (белый список)
+-- 2.7: Безопасное обновление статуса зачисления (БЕЛЫЙ СПИСОК)
 -- =====================================================
 
 CREATE OR REPLACE FUNCTION app.safe_update_enrollment_status(
@@ -1647,7 +1371,7 @@ AS $$
 DECLARE
     v_status TEXT;
 BEGIN
-    -- Белый список статусов
+    -- Белый список допустимых статусов
     v_status := CASE p_new_status
         WHEN 'active'    THEN 'active'
         WHEN 'completed' THEN 'completed'
@@ -1670,8 +1394,10 @@ $$;
 
 
 -- =====================================================
--- Ограниченная роль приложения для схемы app
+-- ЧАСТЬ 3: ОГРАНИЧЕННАЯ РОЛЬ ПРИЛОЖЕНИЯ
 -- =====================================================
+-- Приложение подключается к БД не под суперпользователем,
+-- а через роль с минимальными правами.
 
 DROP ROLE IF EXISTS web_app_secure;
 CREATE ROLE web_app_secure LOGIN PASSWORD 'SecureApp2024!';
@@ -1709,11 +1435,171 @@ GRANT EXECUTE ON FUNCTION app.safe_update_enrollment_status(INTEGER, INTEGER, TE
 GRANT INSERT ON app.access_logs TO web_app_secure;
 GRANT USAGE ON SEQUENCE app.access_logs_log_id_seq TO web_app_secure;
 
--- Проверка прав:
+-- Проверка прав web_app_secure:
 SELECT grantee, table_schema, table_name, privilege_type
 FROM information_schema.role_table_grants
 WHERE grantee = 'web_app_secure'
 ORDER BY table_name, privilege_type;
+
+
+-- =====================================================
+-- ЧАСТЬ 4: КОМАНДЫ ДЛЯ ПРОВЕРКИ (ДЕМОНСТРАЦИЯ)
+-- =====================================================
+-- Ниже приведены команды, которые можно выполнить
+-- для проверки работы защиты от разных пользователей.
+
+-- =====================================================
+-- 4.1: Проверка от имени СУПЕРПОЛЬЗОВАТЕЛЯ (postgres)
+-- =====================================================
+-- Подключение: psql -U postgres -d online_learning_v2
+
+-- Корректный логин student1:
+SELECT * FROM app.safe_login('student1', 'hash1');
+-- Ожидаемый результат: 1 строка (user_id=1, username=student1, ...)
+
+-- Корректный логин admin1:
+SELECT * FROM app.safe_login('admin1', 'hash8');
+-- Ожидаемый результат: 1 строка (user_id=8, username=admin1, ...)
+
+-- Попытка SQL-инъекции в логине:
+SELECT * FROM app.safe_login(''' OR 1=1 --', 'anything');
+-- Ожидаемый результат: 0 строк — инъекция НЕ сработала!
+
+-- Поиск курсов — корректный:
+SELECT * FROM app.safe_search_courses('Python');
+-- Ожидаемый результат: 1 строка (Основы Python, published)
+
+-- Поиск курсов — инъекция:
+SELECT * FROM app.safe_search_courses(''' OR 1=1 --');
+-- Ожидаемый результат: 0 строк — инъекция НЕ сработала!
+
+-- Сортировка — корректная:
+SELECT * FROM app.safe_list_courses('price', 'asc');
+-- Ожидаемый результат: опубликованные курсы, отсортированные по цене
+
+-- Сортировка — вредоносная:
+SELECT * FROM app.safe_list_courses('title; DROP TABLE app.users; --', 'asc');
+-- Ожидаемый результат: сортировка по created_at DESC (значение по умолчанию)
+
+-- Зачисления пользователя student1 (user_id=1):
+SELECT * FROM app.safe_get_enrollments(1);
+-- Ожидаемый результат: курсы, на которые зачислен student1
+
+
+-- =====================================================
+-- 4.2: Проверка от имени STUDENT1
+-- =====================================================
+-- Подключение: psql -U student1 -d online_learning_v2 -W
+-- Пароль: StudentPass123
+
+-- Студент вызывает безопасный логин:
+SELECT * FROM app.safe_login('student1', 'hash1');
+-- Ожидаемый результат: 1 строка (student1)
+
+-- Студент пытается инъекцию:
+SELECT * FROM app.safe_login(''' OR 1=1 --', 'x');
+-- Ожидаемый результат: 0 строк
+
+-- Студент ищет курсы:
+SELECT * FROM app.safe_search_courses('Python');
+-- Ожидаемый результат: 1 строка (Основы Python)
+
+-- Студент смотрит свои зачисления:
+SELECT * FROM app.safe_get_enrollments(1);
+-- Ожидаемый результат: зачисления student1
+
+-- Студент пытается напрямую читать всех пользователей (RLS ограничит):
+SELECT * FROM app.users;
+-- Ожидаемый результат: только своя строка (student1) — RLS!
+
+-- Студент пытается удалить таблицу (нет прав):
+-- DROP TABLE app.users;
+-- Ожидаемый результат: ERROR: must be owner of table users
+
+
+-- =====================================================
+-- 4.3: Проверка от имени TEACHER1
+-- =====================================================
+-- Подключение: psql -U teacher1 -d online_learning_v2 -W
+-- Пароль: TeacherPass123
+
+-- Учитель вызывает безопасный логин:
+SELECT * FROM app.safe_login('teacher1', 'hash3');
+-- Ожидаемый результат: 1 строка (teacher1)
+
+-- Учитель ищет курсы:
+SELECT * FROM app.safe_search_courses('Веб');
+-- Ожидаемый результат: 1 строка (Веб-разработка, published)
+
+-- Учитель смотрит список курсов с сортировкой:
+SELECT * FROM app.safe_list_courses('title', 'asc');
+-- Ожидаемый результат: опубликованные курсы по алфавиту
+
+-- Учитель пытается вредоносную сортировку:
+SELECT * FROM app.safe_list_courses('price; DELETE FROM app.users; --', 'desc');
+-- Ожидаемый результат: сортировка по created_at DESC (по умолчанию)
+
+-- Учитель пытается обновить статус зачисления:
+SELECT app.safe_update_enrollment_status(1, 1, 'completed');
+-- Ожидаемый результат: true (статус обновлён)
+
+-- Учитель пытается передать недопустимый статус:
+SELECT app.safe_update_enrollment_status(1, 1, 'hacked''; DROP TABLE app.users; --');
+-- Ожидаемый результат: ERROR: Недопустимый статус
+
+
+-- =====================================================
+-- 4.4: Проверка от имени WEB_APP_SECURE (роль приложения)
+-- =====================================================
+-- Подключение: psql -U web_app_secure -d online_learning_v2 -W
+-- Пароль: SecureApp2024!
+
+-- Приложение вызывает безопасный логин:
+SELECT * FROM app.safe_login('student1', 'hash1');
+-- Ожидаемый результат: 1 строка
+
+-- Приложение ищет курсы:
+SELECT * FROM app.safe_search_courses('Python');
+-- Ожидаемый результат: 1 строка
+
+-- Приложение пытается удалить данные (нет прав):
+-- DELETE FROM app.users WHERE user_id = 1;
+-- Ожидаемый результат: ERROR: permission denied for table users
+
+-- Приложение пытается изменить пароль (нет прав на UPDATE users):
+-- UPDATE app.users SET password_hash = 'hacked' WHERE username = 'admin1';
+-- Ожидаемый результат: ERROR: permission denied for table users
+
+-- Приложение пытается DROP TABLE (нет прав):
+-- DROP TABLE app.courses;
+-- Ожидаемый результат: ERROR: must be owner of table courses
+
+-- Проверка матрицы прав:
+SELECT grantee, table_schema, table_name, privilege_type
+FROM information_schema.role_table_grants
+WHERE grantee = 'web_app_secure'
+ORDER BY table_name, privilege_type;
+
+
+-- =====================================================
+-- 4.5: Проверка от имени ADMIN1
+-- =====================================================
+-- Подключение: psql -U admin1 -d online_learning_v2 -W
+-- Пароль: AdminPass777
+
+-- Админ видит всех пользователей (RLS разрешает):
+SELECT user_id, username, full_name FROM app.users;
+-- Ожидаемый результат: все 8 пользователей
+
+-- Админ вызывает безопасные функции:
+SELECT * FROM app.safe_login('admin1', 'hash8');
+-- Ожидаемый результат: 1 строка (admin1)
+
+SELECT * FROM app.safe_search_courses('Java');
+-- Ожидаемый результат: 0 строк (Java-разработчик имеет статус archived)
+
+SELECT * FROM app.safe_list_courses('price', 'desc');
+-- Ожидаемый результат: опубликованные курсы по убыванию цены
 
 
 -- =====================================================
@@ -1724,29 +1610,35 @@ ORDER BY table_name, privilege_type;
 -- │ Фрагмент             │ Проблема                           │ Опасный пример ввода         │ Исправление                               │ Мера защиты      │
 -- ├──────────────────────┼────────────────────────────────────┼──────────────────────────────┼───────────────────────────────────────────┼──────────────────┤
 -- │ Аутентификация       │ Конкатенация username и password   │ username: ' OR 1=1 --        │ Параметризованный запрос ($1, $2)         │ ПАРАМЕТРИЗАЦИЯ   │
--- │ (login)              │ в SQL без экранировки              │ → обход аутентификации,      │ через client.query({ text, values })     │                  │
--- │                      │                                    │ доступ ко ВСЕМ пользователям │ + функция app.safe_login($1, $2)         │                  │
+-- │ (app.users)          │ в SQL без экранировки              │ → обход аутентификации,      │ + функция app.safe_login($1, $2)         │                  │
+-- │                      │                                    │ доступ ко ВСЕМ пользователям │                                           │                  │
 -- ├──────────────────────┼────────────────────────────────────┼──────────────────────────────┼───────────────────────────────────────────┼──────────────────┤
--- │ Поиск задач/курсов   │ Конкатенация status/keyword        │ status: ' OR 1=1 --          │ Параметризованный запрос ($1)             │ ПАРАМЕТРИЗАЦИЯ   │
--- │ (findTasksByStatus,  │ в WHERE без экранировки            │ → возврат ВСЕХ записей       │ через client.query(sql, [status])        │                  │
--- │  searchCourses)      │                                    │ включая скрытые              │ + функция app.safe_search_courses($1)    │                  │
+-- │ Поиск курсов         │ Конкатенация keyword               │ keyword: %' OR 1=1 --        │ Параметризованный запрос ($1)             │ ПАРАМЕТРИЗАЦИЯ   │
+-- │ (app.courses)        │ в WHERE ILIKE без экранировки      │ → возврат ВСЕХ курсов        │ + функция app.safe_search_courses($1)    │                  │
+-- │                      │                                    │ включая draft и archived     │                                           │                  │
 -- ├──────────────────────┼────────────────────────────────────┼──────────────────────────────┼───────────────────────────────────────────┼──────────────────┤
--- │ Сортировка           │ Прямая подстановка sortField       │ sortField: title; DROP TABLE │ Белый список allowedFields +             │ БЕЛЫЕ СПИСКИ     │
--- │ (listTasks,          │ и sortDirection в ORDER BY         │ injection_lab.tasks; --      │ allowedDirections со значениями           │                  │
--- │  listCourses)        │ без проверки                       │ → удаление таблицы           │ по умолчанию + функция                   │                  │
--- │                      │                                    │                              │ app.safe_list_courses($1, $2)             │                  │
+-- │ Сортировка           │ Прямая подстановка sortBy          │ sortBy: title; DROP TABLE    │ Белый список полей (CASE) +              │ БЕЛЫЕ СПИСКИ     │
+-- │ (app.courses)        │ и order в ORDER BY                 │ app.courses; --              │ белый список направлений +               │                  │
+-- │                      │ без проверки                       │ → удаление таблицы           │ функция app.safe_list_courses($1, $2)    │                  │
 -- └──────────────────────┴────────────────────────────────────┴──────────────────────────────┴───────────────────────────────────────────┴──────────────────┘
 
--- Итого:
--- ПАРАМЕТРИЗАЦИЯ применялась: Аутентификация ($1, $2), Поиск задач/курсов ($1), Зачисления ($1), Форум ($1, $2), Сдача работ ($1, $2, $3)
--- БЕЛЫЕ СПИСКИ применялись:   Сортировка (allowedFields, allowedDirections, CASE), Обновление статуса (допустимые значения active/completed/dropped)
+-- Где применялась ПАРАМЕТРИЗАЦИЯ:
+--   • Аутентификация: app.safe_login($1, $2)
+--   • Поиск курсов: app.safe_search_courses($1)
+--   • Зачисления: app.safe_get_enrollments($1)
+--   • Форум: app.safe_get_forum_posts($1, $2)
+--   • Сдача работ: app.safe_submit_assignment($1, $2, $3)
+
+-- Где применялись БЕЛЫЕ СПИСКИ:
+--   • Сортировка курсов: app.safe_list_courses — CASE для полей и направлений
+--   • Обновление статуса: app.safe_update_enrollment_status — CASE для статусов (active/completed/dropped)
 
 -- Многоуровневая защита нашей БД:
 -- 1 уровень: Параметризованные запросы / белые списки (код приложения)
--- 2 уровень: Хранимые функции с SECURITY DEFINER (safe_login, safe_search_courses и т.д.)
--- 3 уровень: Ограниченные роли web_app_demo и web_app_secure (минимальные привилегии)
--- 4 уровень: RLS-политики (строковая безопасность, реализовано в практиках 3-6 выше)
--- 5 уровень: RBAC (ролевой доступ app_guest → app_student → ... → app_admin, реализовано выше)
+-- 2 уровень: Хранимые функции с SECURITY DEFINER (app.safe_*)
+-- 3 уровень: Ограниченная роль web_app_secure (минимальные привилегии)
+-- 4 уровень: RLS-политики (строковая безопасность, реализовано выше)
+-- 5 уровень: RBAC (ролевой доступ app_guest → ... → app_admin, реализовано выше)
 
 -- =====================================================
 -- КОНЕЦ ПРАКТИКИ 9
